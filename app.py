@@ -299,6 +299,48 @@ def _worker_transcribe(job_id: str, filepath: str, original_filename: str, model
             result = mdl.transcribe(filepath, **transcribe_kwargs)
             text_output = result.get("text", "").strip()
             all_segments = result.get("segments", [])
+        
+        if progress_mode in {"chunks", "segments"} and duration_seconds > 5:
+            if progress_mode == "chunks":
+                window_sec = 30
+            else:  # segments mode (finer granularity)
+                window_sec = int(os.environ.get("SEGMENT_WINDOW_SEC", "5"))
+                if window_sec < 2:
+                    window_sec = 2
+                if window_sec > 30:
+                    window_sec = 30
+            segment_len_samples = window_sec * 16000
+            total_segments = math.ceil(len(audio) / segment_len_samples)
+            for i in range(total_segments):
+                start = i * segment_len_samples
+                end = min((i + 1) * segment_len_samples, len(audio))
+                segment_audio = audio[start:end]
+                # Call model on raw samples for window
+                result = mdl.transcribe(segment_audio, **transcribe_kwargs)
+                seg_text = result.get("text", "").strip()
+                if seg_text:
+                    accumulated_text.append(seg_text)
+                
+                # Extract segments with timestamps adjusted for chunk offset
+                chunk_start_time = start / 16000.0
+                if result.get("segments"):
+                    for seg in result["segments"]:
+                        adjusted_seg = {
+                            "start": seg["start"] + chunk_start_time,
+                            "end": seg["end"] + chunk_start_time,
+                            "text": seg["text"]
+                        }
+                        accumulated_segments.append(adjusted_seg)
+                
+                processed_until = end / 16000.0
+                pct = min(100.0, (processed_until / duration_seconds) * 100.0)
+                _worker_progress(job_id, pct, partial=True, mode=progress_mode)
+            text_output = " ".join(accumulated_text).strip()
+            all_segments = accumulated_segments
+        else:
+            result = mdl.transcribe(filepath, **transcribe_kwargs)
+            text_output = result.get("text", "").strip()
+            all_segments = result.get("segments", [])
         if not text_output:
             raise ValueError("Transcription returned empty text.")
         
@@ -345,17 +387,133 @@ def spawn_job_process(job_id: str):
         job["status"] = "processing"
         job["start_time"] = time.time()
         log_event(job_id, "Started processing")
+    
     model_size = job.get("model_size", MODEL_SIZE)
     options = job.get("options", DEFAULT_OPTIONS)
-    p = mp.Process(target=_worker_transcribe, args=(job_id, job["filepath"], job["original_filename"], model_size, options), daemon=True)
-    job_processes[job_id] = p
-    p.start()
+    
+    # Use threading with progress updates
+    def worker_with_progress():
+        try:
+            import whisper
+            import numpy as np
+            
+            # Load model
+            update_job(job_id, progress_pct=5.0)
+            log_event(job_id, f"Loading {model_size} model...")
+            mdl = whisper.load_model(model_size)
+            
+            # Load audio
+            update_job(job_id, progress_pct=15.0)
+            log_event(job_id, "Loading audio...")
+            cached_path = job["filepath"] + ".npy"
+            if os.path.exists(cached_path):
+                try:
+                    audio = np.load(cached_path)
+                    log_event(job_id, "Using cached audio")
+                except Exception:
+                    audio = whisper.load_audio(job["filepath"])
+            else:
+                audio = whisper.load_audio(job["filepath"])
+                
+            if audio.size == 0:
+                raise ValueError("Empty audio file")
+            
+            duration = len(audio) / 16000.0
+            log_event(job_id, f"Audio duration: {duration:.1f} seconds")
+            
+            # Start transcription
+            update_job(job_id, progress_pct=25.0)
+            log_event(job_id, "Starting transcription...")
+            
+            result = mdl.transcribe(job["filepath"], 
+                                   task=options.get("task", "transcribe"),
+                                   temperature=options.get("temperature", 0.0),
+                                   beam_size=options.get("beam_size", 1),
+                                   best_of=options.get("best_of", 1),
+                                   verbose=False)
+            
+            update_job(job_id, progress_pct=80.0)
+            log_event(job_id, "Processing transcription results...")
+            
+            text_output = result.get("text", "").strip()
+            if not text_output:
+                raise ValueError("No transcription output")
+                
+            # Create output with timestamps
+            segments = result.get("segments", [])
+            output_lines = ["=== TRANSCRIPT ===", text_output, ""]
+            
+            if segments:
+                output_lines.append("=== TIMESTAMPED TRANSCRIPT ===")
+                for seg in segments:
+                    start_min = int(seg["start"] // 60)
+                    start_sec = int(seg["start"] % 60)
+                    end_min = int(seg["end"] // 60)
+                    end_sec = int(seg["end"] % 60)
+                    timestamp = f"[{start_min:02d}:{start_sec:02d} - {end_min:02d}:{end_sec:02d}]"
+                    output_lines.append(f"{timestamp} {seg['text'].strip()}")
+            
+            # Save output
+            update_job(job_id, progress_pct=95.0)
+            log_event(job_id, "Saving transcript...")
+            
+            filename_base = os.path.splitext(os.path.basename(job["original_filename"]))[0]
+            txt_filename = f"{filename_base}.txt"
+            txt_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex[:6]}_{txt_filename}")
+            
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(output_lines))
+                
+            # Complete
+            update_job(job_id, status="done", 
+                      transcript_path=txt_path, 
+                      transcript_filename=txt_filename, 
+                      progress_pct=100.0)
+            log_event(job_id, "Transcription completed successfully!")
+                            
+        except Exception as e:
+            update_job(job_id, status="error", error=str(e), progress_pct=0.0)
+            log_event(job_id, f"Transcription error: {e}")
+    
+    # Run in thread 
+    import threading
+    t = threading.Thread(target=worker_with_progress, daemon=True)
+    t.start()
     return True
 
 def update_job(job_id: str, **fields):
     with jobs_lock:
         if job_id in jobs:
-            jobs[job_id].update(fields)
+            job = jobs[job_id]
+            job.update(fields)
+            
+            # Calculate ETA when progress or status changes
+            if "progress_pct" in fields or "status" in fields:
+                current_time = time.time()
+                
+                # Calculate ETA based on status and progress
+                if job.get("status") == "processing":
+                    progress = job.get("progress_pct", 0.0)
+                    start_time = job.get("start_time", current_time)
+                    elapsed = current_time - start_time
+                    
+                    if progress > 0 and elapsed > 0:
+                        # Progress-based ETA
+                        estimated_total_time = elapsed * (100.0 / progress)
+                        eta_seconds = estimated_total_time - elapsed
+                        job["eta_seconds"] = max(0, eta_seconds)
+                    elif "expected_total_seconds" in job:
+                        # Fallback to model-based estimate
+                        expected_total = job["expected_total_seconds"]
+                        eta_seconds = expected_total - elapsed
+                        job["eta_seconds"] = max(0, eta_seconds)
+                elif job.get("status") in {"preparing", "ready", "queued"}:
+                    # Use model-based estimate for non-processing states
+                    if "expected_total_seconds" in job:
+                        job["eta_seconds"] = job["expected_total_seconds"]
+                elif job.get("status") in {"done", "error", "cancelled"}:
+                    # No ETA for terminal states
+                    job["eta_seconds"] = 0
 
 def log_event(job_id: str, message: str):
     with jobs_lock:
@@ -633,6 +791,66 @@ def list_jobs():
     # sort newest first
     out.sort(key=lambda x: x.get("created_at") or 0, reverse=True)
     return jsonify(out)
+
+@app.route("/clear-cache", methods=["POST"])
+def clear_cache():
+    """Clear cached audio files and original uploads from memory and disk"""
+    try:
+        deleted_files = []
+        freed_memory_mb = 0
+        
+        # Find all files in uploads folder
+        audio_files = []
+        npy_files = []
+        if os.path.exists(UPLOAD_FOLDER):
+            for filename in os.listdir(UPLOAD_FOLDER):
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                if os.path.exists(filepath):
+                    # Get file size before deletion
+                    size_bytes = os.path.getsize(filepath)
+                    freed_memory_mb += size_bytes / (1024 * 1024)
+                    
+                    if filename.endswith('.npy'):
+                        npy_files.append(filepath)
+                    elif any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS):
+                        audio_files.append(filepath)
+        
+        # Delete both audio files and .npy cache files
+        all_files = audio_files + npy_files
+        for filepath in all_files:
+            try:
+                os.remove(filepath)
+                deleted_files.append(os.path.basename(filepath))
+            except Exception as e:
+                print(f"Warning: Could not delete {filepath}: {e}")
+        
+        # Force garbage collection to free memory
+        import gc
+        gc.collect()
+        
+        audio_count = len(audio_files)
+        cache_count = len(npy_files)
+        total_count = len(deleted_files)
+        
+        if total_count > 0:
+            message = f"Cleared {total_count} files ({audio_count} audio + {cache_count} cache)"
+        else:
+            message = "No files to clear"
+        
+        return jsonify({
+            "success": True,
+            "message": message,
+            "deleted_files": deleted_files,
+            "audio_files_deleted": audio_count,
+            "cache_files_deleted": cache_count,
+            "freed_memory_mb": round(freed_memory_mb, 2)
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")

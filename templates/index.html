@@ -18,6 +18,7 @@
     #controls button { background:#2563eb; border:none; color:#fff; padding:10px 18px; margin-right:10px; border-radius:10px; font-size:14px; cursor:pointer; font-weight:500; box-shadow:0 2px 4px rgba(0,0,0,.1); transition: background .2s, transform .15s; }
     #controls button.secondary { background:#64748b; }
     #controls button.danger { background:#dc2626; }
+    #controls button.warning { background:#f59e0b; }
     #controls button:disabled { opacity:.45; cursor:not-allowed; }
     #controls button:not(:disabled):active { transform:translateY(1px); }
     #progress { width:100%; height:14px; border-radius:7px; background:#e2e8f0; overflow:hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,.12); }
@@ -64,6 +65,7 @@
         <button id="btn-cancel" class="danger" disabled>Cancel</button>
         <button id="btn-download" class="secondary" disabled>Download Text</button>
         <button id="btn-reset" class="secondary" disabled>Reset</button>
+        <button id="btn-clear-cache" class="warning" title="Clear all uploaded audio files and cached data from memory">Clear All Files</button>
       </div>
   <div id="option-panel" style="background:#fff; border:1px solid #e2e8f0; padding:16px 18px 10px; border-radius:14px; margin-bottom:18px; box-shadow:0 2px 6px -2px rgba(0,0,0,.08); position:relative;">
         <div style="display:flex; gap:18px; flex-wrap:wrap; align-items:flex-end;">
@@ -125,6 +127,7 @@
     const cancelBtn = document.getElementById('btn-cancel');
     const dlBtn = document.getElementById('btn-download');
     const resetBtn = document.getElementById('btn-reset');
+    const clearCacheBtn = document.getElementById('btn-clear-cache');
     document.getElementById('model-tag').textContent = 'loading';
 
     const modelSelect = document.getElementById('model-select');
@@ -294,15 +297,18 @@
 
     function enableControls(state){
       if (state==='ready'){
-        startBtn.disabled=false; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=false;
+        startBtn.disabled=false; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=false; clearCacheBtn.disabled=false;
       } else if (state==='processing'){
-        startBtn.disabled=true; cancelBtn.disabled=false; dlBtn.disabled=true; resetBtn.disabled=true;
+        startBtn.disabled=true; cancelBtn.disabled=false; dlBtn.disabled=true; resetBtn.disabled=true; clearCacheBtn.disabled=true;
       } else if (state==='done'){
-        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=false; resetBtn.disabled=false;
+        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=false; resetBtn.disabled=false; clearCacheBtn.disabled=false;
       } else if (state==='error' || state==='cancelled'){
-        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=false;
+        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=false; clearCacheBtn.disabled=false;
       } else if (state==='preparing'){
-        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=false;
+        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=false; clearCacheBtn.disabled=false;
+      } else {
+        // reset state - disable all controls initially
+        startBtn.disabled=true; cancelBtn.disabled=true; dlBtn.disabled=true; resetBtn.disabled=true; clearCacheBtn.disabled=false;
       }
     }
 
@@ -355,6 +361,28 @@
 
     resetBtn.addEventListener('click', ()=>{
       resetUI(true);
+    });
+
+    clearCacheBtn.addEventListener('click', async ()=>{
+      const originalText = clearCacheBtn.textContent;
+      clearCacheBtn.disabled = true;
+      clearCacheBtn.textContent = 'Clearing...';
+      
+      try {
+        const response = await fetch('/clear-cache', { method: 'POST' });
+        const data = await response.json();
+        
+        if (data.success) {
+          setStatus(`✓ ${data.message} (${data.freed_memory_mb} MB freed)`, 'ok');
+        } else {
+          setStatus(`✗ Cache clear failed: ${data.error}`, 'error');
+        }
+      } catch (err) {
+        setStatus(`✗ Cache clear error: ${err.message}`, 'error');
+      } finally {
+        clearCacheBtn.disabled = false;
+        clearCacheBtn.textContent = originalText;
+      }
     });
 
     function resetUI(clearMeta){
