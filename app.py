@@ -303,9 +303,34 @@ def spawn_job_process(job_id: str):
     return True
 
 def update_job(job_id: str, **fields):
+    """Update job fields and maintain ETA/progress metadata."""
     with jobs_lock:
         if job_id in jobs:
-            jobs[job_id].update(fields)
+            job = jobs[job_id]
+            job.update(fields)
+
+            # Whenever progress or status changes, recalculate ETA based on
+            # elapsed time and any model-based estimates.
+            if "progress_pct" in fields or "status" in fields:
+                current_time = time.time()
+
+                if job.get("status") == "processing":
+                    progress = job.get("progress_pct", 0.0)
+                    start_time = job.get("start_time", current_time)
+                    elapsed = current_time - start_time
+
+                    if progress > 0 and elapsed > 0:
+                        # Derive total time from current progress
+                        estimated_total = elapsed * (100.0 / progress)
+                        job["eta_seconds"] = max(0.0, estimated_total - elapsed)
+                    elif "expected_total_seconds" in job:
+                        expected_total = job["expected_total_seconds"]
+                        job["eta_seconds"] = max(0.0, expected_total - elapsed)
+                elif job.get("status") in {"preparing", "ready", "queued"}:
+                    if "expected_total_seconds" in job:
+                        job["eta_seconds"] = job["expected_total_seconds"]
+                elif job.get("status") in {"done", "error", "cancelled"}:
+                    job["eta_seconds"] = 0.0
 
 def log_event(job_id: str, message: str):
     with jobs_lock:
