@@ -1,0 +1,4 @@
+Flask>=3.0,<4
+openai-whisper>=20231117
+# torch is required by openai-whisper; listed explicitly for clarity.
+torch
