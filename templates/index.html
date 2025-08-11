@@ -394,7 +394,15 @@
     function pollStatus(){
       if (!currentJob) return;
       fetch('/status/'+currentJob)
-        .then(r=>r.json())
+        .then(r=>{
+          if (r.status === 404) {
+            // Job no longer exists (likely due to app restart)
+            setStatus('Job expired - please upload again', 'error');
+            resetUI(true);
+            return Promise.reject('Job not found');
+          }
+          return r.json();
+        })
         .then(data=>{
           if (data.error){ setStatus('Error: '+data.error,'error'); return; }
           const st=data.status; const metaStatus=document.getElementById('meta-status'); if(metaStatus) metaStatus.textContent=st;
@@ -440,7 +448,14 @@
             enableControls('ready');
           }
         })
-        .catch(()=>{ setStatus('Status polling error','error'); pollTimer=setTimeout(pollStatus,3000); });
+        .catch((err)=>{ 
+          if (err === 'Job not found') {
+            // Already handled above, don't continue polling
+            return;
+          }
+          setStatus('Status polling error','error'); 
+          pollTimer=setTimeout(pollStatus,3000); 
+        });
     }
 
     let etaTimer=null; let lastEtaSeconds=null;
@@ -464,7 +479,13 @@
       if (!currentJob) return;
       const run = () => {
         fetch('/logs/'+currentJob+'?since='+logOffset)
-          .then(r=>r.json())
+          .then(r=>{
+            if (r.status === 404) {
+              // Job no longer exists, stop log polling
+              return Promise.reject('Job not found');
+            }
+            return r.json();
+          })
           .then(data=>{
             if (data.entries){
               for (const entry of data.entries){
@@ -473,7 +494,13 @@
               logOffset = data.next;
             }
             logTimer=setTimeout(run, 1500);
-          }).catch(()=> { logTimer=setTimeout(run,3000); });
+          }).catch((err)=> { 
+            if (err === 'Job not found') {
+              // Stop polling if job doesn't exist
+              return;
+            }
+            logTimer=setTimeout(run,3000); 
+          });
       };
       run();
     }
