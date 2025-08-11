@@ -110,7 +110,7 @@
       <div id="logs"></div>
     </div>
   </div>
-  <footer>Local processing using Whisper (<span id="model-tag" class="badge"></span>)</footer>
+  <footer>Made by <a href="https://gopichand.me" target="_blank" rel="noopener">Gopichand Busam</a> – Open Source | Local processing using Whisper (<span id="model-tag" class="badge"></span>)</footer>
   <script>
     const dropArea = document.getElementById('drop-area');
     const fileInput = document.getElementById('file-input');
@@ -151,7 +151,7 @@
       });
       // Restore from localStorage or set defaults
       const saved = JSON.parse(localStorage.getItem('whisperSettings')||'{}');
-      modelSelect.value = saved.model_size || d.default_model;
+      modelSelect.value = saved.model_size || d.suggested_model || d.default_model;
       taskSelect.value = saved.task || 'transcribe';
       tempInput.value = saved.temperature ?? d.default_options.temperature;
       beamInput.value = saved.beam_size ?? d.default_options.beam_size;
@@ -216,6 +216,12 @@
       return (bytes/Math.pow(k,i)).toFixed(2)+' '+sizes[i];
     }
 
+    function secondsToHuman(sec){
+      const s = Math.round(sec);
+      const m = Math.floor(s/60); const rem = s%60;
+      return (m>0?m+'m ':'')+rem+'s';
+    }
+
     function setStatus(msg, tone='normal') {
       statusDiv.textContent = msg;
       statusDiv.style.color = tone==='error' ? '#dc2626' : tone==='ok'? '#065f46':'#334155';
@@ -243,8 +249,14 @@
         if (xhr.status === 201){
           const data = JSON.parse(xhr.responseText);
           currentJob = data.job_id;
-            progressBar.style.width = '100%';
-          showMeta({filename: file.name, size: data.size_bytes});
+          progressBar.style.width = '100%';
+          showMeta({
+            filename: file.name,
+            size: data.size_bytes,
+            duration: data.duration_seconds,
+            recommended: data.recommended_model,
+            analysis: data.analysis
+          });
           // Initially in preparing state; UI will poll until ready
           setStatus('Preparing audio ...');
           enableControls('preparing');
@@ -259,12 +271,22 @@
     }
 
     function showMeta(info){
-      metaDiv.innerHTML = `<table><tbody>
-        <tr><th>Filename</th><td>${info.filename}</td></tr>
-        <tr><th>Size</th><td>${bytesToHuman(info.size)}</td></tr>
-        <tr><th>Status</th><td id="meta-status" class="badge">ready</td></tr>
-        <tr><th>Job ID</th><td><code>${currentJob}</code></td></tr>
-      </tbody></table>`;
+      let rows = `<tr><th>Filename</th><td>${info.filename}</td></tr>`+
+                 `<tr><th>Size</th><td>${bytesToHuman(info.size)}</td></tr>`+
+                 (info.duration?`<tr><th>Duration</th><td>${secondsToHuman(info.duration)}</td></tr>`:'')+
+                 (info.recommended?`<tr><th>Suggested Model</th><td>${info.recommended}</td></tr>`:'')+
+                 `<tr><th>Status</th><td id="meta-status" class="badge">ready</td></tr>`+
+                 `<tr><th>Job ID</th><td><code>${currentJob}</code></td></tr>`;
+      let html = `<table><tbody>${rows}</tbody></table>`;
+      if (info.analysis && info.analysis.length){
+        const body = info.analysis.map(a=>{
+          const eta = (typeof a.eta_seconds==='number')?secondsToHuman(a.eta_seconds):'?';
+          const mem = a.memory_gb!=null? a.memory_gb.toFixed? a.memory_gb.toFixed(1)+' GB':a.memory_gb+' GB':'?';
+          return `<tr><td>${a.model}</td><td>${eta}</td><td>${mem}</td></tr>`;
+        }).join('');
+        html += `<div style="overflow-x:auto; margin-top:10px;"><table><thead><tr><th>Model</th><th>ETA</th><th>RAM</th></tr></thead><tbody>${body}</tbody></table></div>`;
+      }
+      metaDiv.innerHTML = html;
       metaDiv.classList.remove('hidden');
       controls.classList.remove('hidden');
       logsWrap.classList.remove('hidden');

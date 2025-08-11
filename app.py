@@ -5,7 +5,7 @@ import threading
 import time
 import whisper
 import multiprocessing as mp
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import numpy as np  # type: ignore
 import math
 import json
@@ -38,7 +38,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
 
 # Supported Whisper model sizes (update as library evolves)
-SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
+MODEL_ORDER = ["tiny", "base", "small", "medium", "turbo", "large", "large-v2", "large-v3"]
+SUPPORTED_MODELS = MODEL_ORDER.copy()
 if MODEL_SIZE not in SUPPORTED_MODELS:
     SUPPORTED_MODELS.append(MODEL_SIZE)
 
@@ -74,6 +75,7 @@ MODEL_RTF_FACTORS_CPU = {
     "base": 0.6,
     "small": 0.9,
     "medium": 1.4,
+    "turbo": 0.3,
     "large": 2.2,
     "large-v2": 2.0,
     "large-v3": 1.8,
@@ -85,6 +87,7 @@ MODEL_RTF_FACTORS_GPU = {
     "base": 0.09,
     "small": 0.15,
     "medium": 0.32,
+    "turbo": 0.07,
     "large": 0.50,
     "large-v2": 0.46,
     "large-v3": 0.42,
@@ -107,10 +110,50 @@ MODEL_MEMORY_GB = {
     "base": 1.3,
     "small": 2.5,
     "medium": 5.0,
+    "turbo": 6.0,
     "large": 7.5,
     "large-v2": 7.5,
     "large-v3": 7.8,
 }
+
+
+def analyze_models(duration_seconds: float) -> List[Dict[str, Any]]:
+    """Return ETA and rough RAM needs for each model given audio duration."""
+    analysis: List[Dict[str, Any]] = []
+    for m in SUPPORTED_MODELS:
+        rtf = MODEL_RTF_FACTORS.get(m)
+        eta = duration_seconds * rtf if rtf and duration_seconds is not None else None
+        analysis.append(
+            {
+                "model": m,
+                "eta_seconds": eta,
+                "memory_gb": MODEL_MEMORY_GB.get(m),
+            }
+        )
+    return analysis
+
+
+def suggest_model(duration_seconds: Optional[float] = None) -> str:
+    """Heuristic recommended model based on hardware and audio length."""
+    if IS_GPU:
+        total_mem = None
+        try:
+            total_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        for m in reversed(SUPPORTED_MODELS):
+            req = MODEL_MEMORY_GB.get(m)
+            if total_mem and req and req * 1.1 <= total_mem:
+                return m
+        return MODEL_SIZE
+    # CPU path
+    if duration_seconds is None:
+        return "base"
+    for m in reversed(SUPPORTED_MODELS):
+        rtf = MODEL_RTF_FACTORS_CPU.get(m)
+        if rtf and duration_seconds * rtf <= 1800:  # aim for under ~30m processing
+            return m
+    return "tiny"
 
 def _preprocess_audio(job_id: str):
     """Load audio into memory, save as .npy for faster model load, update progress incrementally."""
@@ -348,6 +391,8 @@ def upload():
         duration_seconds = float(len(audio) / 16000.0)
     except Exception:  # noqa: BLE001
         pass
+    analysis = analyze_models(duration_seconds or 0.0) if duration_seconds else []
+    recommended = suggest_model(duration_seconds)
     job_id = uuid.uuid4().hex
     with jobs_lock:
         jobs[job_id] = {
@@ -362,6 +407,7 @@ def upload():
             "duration_seconds": duration_seconds,
             "prep_status": "pending",
             "prep_progress_pct": 0.0,
+            "suggested_model": recommended,
         }
         # Rough expected prep seconds heuristic (bounded)
         expected_prep = None
@@ -372,7 +418,14 @@ def upload():
     log_event(job_id, f"Uploaded file ({size_bytes} bytes)")
     log_event(job_id, "Audio preprocessing queued")
     threading.Thread(target=_preprocess_audio, args=(job_id,), daemon=True).start()
-    return jsonify({"job_id": job_id, "status": "preparing", "size_bytes": size_bytes, "duration_seconds": duration_seconds}), 201
+    return jsonify({
+        "job_id": job_id,
+        "status": "preparing",
+        "size_bytes": size_bytes,
+        "duration_seconds": duration_seconds,
+        "analysis": analysis,
+        "recommended_model": recommended,
+    }), 201
 
 @app.route("/start/<job_id>", methods=["POST"])
 def start(job_id: str):
@@ -389,7 +442,7 @@ def start(job_id: str):
             body = request.get_json(force=True, silent=True) or {}
         except Exception:  # noqa: BLE001
             return jsonify({"error": "Invalid JSON body"}), 400
-    chosen_model = body.get("model_size") or MODEL_SIZE
+    chosen_model = body.get("model_size") or job.get("suggested_model") or MODEL_SIZE
     if chosen_model not in SUPPORTED_MODELS:
         return jsonify({"error": f"Unsupported model_size '{chosen_model}'"}), 400
     # Options
@@ -542,6 +595,7 @@ def health():
         "model_rtf_factors_gpu": MODEL_RTF_FACTORS_GPU,
         "model_memory_gb": MODEL_MEMORY_GB,
         "gpu": {"available": IS_GPU, "name": GPU_NAME},
+        "suggested_model": suggest_model(),
     }
 
 @app.route("/jobs")
