@@ -5,9 +5,8 @@ import threading
 import time
 import whisper
 import multiprocessing as mp
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import numpy as np  # type: ignore
-import math
 import json
 try:
     import torch  # type: ignore
@@ -38,7 +37,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
 
 # Supported Whisper model sizes (update as library evolves)
-SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
+MODEL_ORDER = ["tiny", "base", "small", "medium", "turbo", "large", "large-v2", "large-v3"]
+SUPPORTED_MODELS = MODEL_ORDER.copy()
 if MODEL_SIZE not in SUPPORTED_MODELS:
     SUPPORTED_MODELS.append(MODEL_SIZE)
 
@@ -74,6 +74,7 @@ MODEL_RTF_FACTORS_CPU = {
     "base": 0.6,
     "small": 0.9,
     "medium": 1.4,
+    "turbo": 0.3,
     "large": 2.2,
     "large-v2": 2.0,
     "large-v3": 1.8,
@@ -85,6 +86,7 @@ MODEL_RTF_FACTORS_GPU = {
     "base": 0.09,
     "small": 0.15,
     "medium": 0.32,
+    "turbo": 0.07,
     "large": 0.50,
     "large-v2": 0.46,
     "large-v3": 0.42,
@@ -107,10 +109,50 @@ MODEL_MEMORY_GB = {
     "base": 1.3,
     "small": 2.5,
     "medium": 5.0,
+    "turbo": 6.0,
     "large": 7.5,
     "large-v2": 7.5,
     "large-v3": 7.8,
 }
+
+
+def analyze_models(duration_seconds: float) -> List[Dict[str, Any]]:
+    """Return ETA and rough RAM needs for each model given audio duration."""
+    analysis: List[Dict[str, Any]] = []
+    for m in SUPPORTED_MODELS:
+        rtf = MODEL_RTF_FACTORS.get(m)
+        eta = duration_seconds * rtf if rtf and duration_seconds is not None else None
+        analysis.append(
+            {
+                "model": m,
+                "eta_seconds": eta,
+                "memory_gb": MODEL_MEMORY_GB.get(m),
+            }
+        )
+    return analysis
+
+
+def suggest_model(duration_seconds: Optional[float] = None) -> str:
+    """Heuristic recommended model based on hardware and audio length."""
+    if IS_GPU:
+        total_mem = None
+        try:
+            total_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        for m in reversed(SUPPORTED_MODELS):
+            req = MODEL_MEMORY_GB.get(m)
+            if total_mem and req and req * 1.1 <= total_mem:
+                return m
+        return MODEL_SIZE
+    # CPU path
+    if duration_seconds is None:
+        return "base"
+    for m in reversed(SUPPORTED_MODELS):
+        rtf = MODEL_RTF_FACTORS_CPU.get(m)
+        if rtf and duration_seconds * rtf <= 1800:  # aim for under ~30m processing
+            return m
+    return "tiny"
 
 def _preprocess_audio(job_id: str):
     """Load audio into memory, save as .npy for faster model load, update progress incrementally."""
@@ -131,7 +173,16 @@ def _preprocess_audio(job_id: str):
             update_job(job_id, status="error", error="Empty audio after load")
             log_event(job_id, "Preprocessing failed: empty audio")
             return
-        update_job(job_id, prep_status="normalizing", prep_progress_pct=60.0)
+        duration_seconds = float(len(audio) / 16000.0)
+        update_fields = {"prep_status": "normalizing", "prep_progress_pct": 60.0}
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job and not job.get("duration_seconds"):
+                update_fields["duration_seconds"] = duration_seconds
+                expected_prep = min(20.0, max(2.0, duration_seconds * 0.06))
+                update_fields.setdefault("prep_start_time", time.time())
+                update_fields["prep_expected_total_seconds"] = expected_prep
+        update_job(job_id, **update_fields)
         log_event(job_id, "Normalizing audio")
         # Whisper.load_audio already returns float32 mono 16000; ensure dtype
         audio = audio.astype('float32', copy=False)
@@ -171,26 +222,17 @@ def _worker_complete(job_id: str, status: str, **fields):
     _interprocess_write(job_id, base)
 
 def _worker_transcribe(job_id: str, filepath: str, original_filename: str, model_size: str, options: Dict[str, Any]):
-    """Worker process with optional chunk-level progress for more accurate UI updates.
+    """Worker process that transcribes the entire file in a single pass.
 
-    If environment variable PROGRESS_MODE == 'chunks', audio longer than 35s is segmented into ~30s chunks
-    and each decoded sequentially, emitting progress updates between chunks. This is less efficient than
-    Whisper's internal batching but provides user-visible incremental progress without modifying library internals.
+    Previous versions attempted chunked transcription for progress updates, but that added
+    complexity and slowed down long files. This simplified worker just runs Whisper once
+    and relies on the main process to estimate progress based on elapsed time.
     """
-    progress_mode = os.environ.get("PROGRESS_MODE", "estimate").lower()
     try:
         mdl = whisper.load_model(model_size)
-        # Prefer cached numpy array if preprocessing created it
+        # Use cached numpy array if preprocessing created it to skip reloading
         cached_path = filepath + ".npy"
-        if os.path.exists(cached_path):
-            try:
-                audio = np.load(cached_path)
-            except Exception:
-                audio = whisper.load_audio(filepath)
-        else:
-            audio = whisper.load_audio(filepath)
-        if audio.size == 0:
-            raise ValueError("Uploaded audio appears empty or unreadable.")
+        audio_input: Any = cached_path if os.path.exists(cached_path) else filepath
         transcribe_kwargs = {
             "task": options.get("task", DEFAULT_OPTIONS["task"]),
             "temperature": options.get("temperature", DEFAULT_OPTIONS["temperature"]),
@@ -202,51 +244,11 @@ def _worker_transcribe(job_id: str, filepath: str, original_filename: str, model
         if language:
             transcribe_kwargs["language"] = language
 
-        duration_seconds = len(audio) / 16000.0
-        accumulated_text: List[str] = []
-        accumulated_segments: List[Dict[str, Any]] = []
-        
-        if progress_mode in {"chunks", "segments"} and duration_seconds > 5:
-            if progress_mode == "chunks":
-                window_sec = 30
-            else:  # segments mode (finer granularity)
-                window_sec = int(os.environ.get("SEGMENT_WINDOW_SEC", "5"))
-                if window_sec < 2:
-                    window_sec = 2
-                if window_sec > 30:
-                    window_sec = 30
-            segment_len_samples = window_sec * 16000
-            total_segments = math.ceil(len(audio) / segment_len_samples)
-            for i in range(total_segments):
-                start = i * segment_len_samples
-                end = min((i + 1) * segment_len_samples, len(audio))
-                segment_audio = audio[start:end]
-                # Call model on raw samples for window
-                result = mdl.transcribe(segment_audio, **transcribe_kwargs)
-                seg_text = result.get("text", "").strip()
-                if seg_text:
-                    accumulated_text.append(seg_text)
-                
-                # Extract segments with timestamps adjusted for chunk offset
-                chunk_start_time = start / 16000.0
-                if result.get("segments"):
-                    for seg in result["segments"]:
-                        adjusted_seg = {
-                            "start": seg["start"] + chunk_start_time,
-                            "end": seg["end"] + chunk_start_time,
-                            "text": seg["text"]
-                        }
-                        accumulated_segments.append(adjusted_seg)
-                
-                processed_until = end / 16000.0
-                pct = min(100.0, (processed_until / duration_seconds) * 100.0)
-                _worker_progress(job_id, pct, partial=True, mode=progress_mode)
-            text_output = " ".join(accumulated_text).strip()
-            all_segments = accumulated_segments
-        else:
-            result = mdl.transcribe(filepath, **transcribe_kwargs)
-            text_output = result.get("text", "").strip()
-            all_segments = result.get("segments", [])
+        # Transcribe in one shot for better performance on long files
+        _worker_progress(job_id, 0.0)
+        result = mdl.transcribe(audio_input, **transcribe_kwargs)
+        text_output = result.get("text", "").strip()
+        all_segments = result.get("segments", [])
         if not text_output:
             raise ValueError("Transcription returned empty text.")
         
@@ -339,6 +341,8 @@ def upload():
         duration_seconds = float(len(audio) / 16000.0)
     except Exception:  # noqa: BLE001
         pass
+    analysis = analyze_models(duration_seconds or 0.0) if duration_seconds else []
+    recommended = suggest_model(duration_seconds)
     job_id = uuid.uuid4().hex
     with jobs_lock:
         jobs[job_id] = {
@@ -353,6 +357,7 @@ def upload():
             "duration_seconds": duration_seconds,
             "prep_status": "pending",
             "prep_progress_pct": 0.0,
+            "suggested_model": recommended,
         }
         # Rough expected prep seconds heuristic (bounded)
         expected_prep = None
@@ -363,7 +368,14 @@ def upload():
     log_event(job_id, f"Uploaded file ({size_bytes} bytes)")
     log_event(job_id, "Audio preprocessing queued")
     threading.Thread(target=_preprocess_audio, args=(job_id,), daemon=True).start()
-    return jsonify({"job_id": job_id, "status": "preparing", "size_bytes": size_bytes, "duration_seconds": duration_seconds}), 201
+    return jsonify({
+        "job_id": job_id,
+        "status": "preparing",
+        "size_bytes": size_bytes,
+        "duration_seconds": duration_seconds,
+        "analysis": analysis,
+        "recommended_model": recommended,
+    }), 201
 
 @app.route("/start/<job_id>", methods=["POST"])
 def start(job_id: str):
@@ -380,7 +392,7 @@ def start(job_id: str):
             body = request.get_json(force=True, silent=True) or {}
         except Exception:  # noqa: BLE001
             return jsonify({"error": "Invalid JSON body"}), 400
-    chosen_model = body.get("model_size") or MODEL_SIZE
+    chosen_model = body.get("model_size") or job.get("suggested_model") or MODEL_SIZE
     if chosen_model not in SUPPORTED_MODELS:
         return jsonify({"error": f"Unsupported model_size '{chosen_model}'"}), 400
     # Options
@@ -533,6 +545,7 @@ def health():
         "model_rtf_factors_gpu": MODEL_RTF_FACTORS_GPU,
         "model_memory_gb": MODEL_MEMORY_GB,
         "gpu": {"available": IS_GPU, "name": GPU_NAME},
+        "suggested_model": suggest_model(),
     }
 
 @app.route("/jobs")
