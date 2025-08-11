@@ -131,7 +131,16 @@ def _preprocess_audio(job_id: str):
             update_job(job_id, status="error", error="Empty audio after load")
             log_event(job_id, "Preprocessing failed: empty audio")
             return
-        update_job(job_id, prep_status="normalizing", prep_progress_pct=60.0)
+        duration_seconds = float(len(audio) / 16000.0)
+        update_fields = {"prep_status": "normalizing", "prep_progress_pct": 60.0}
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job and not job.get("duration_seconds"):
+                update_fields["duration_seconds"] = duration_seconds
+                expected_prep = min(20.0, max(2.0, duration_seconds * 0.06))
+                update_fields.setdefault("prep_start_time", time.time())
+                update_fields["prep_expected_total_seconds"] = expected_prep
+        update_job(job_id, **update_fields)
         log_event(job_id, "Normalizing audio")
         # Whisper.load_audio already returns float32 mono 16000; ensure dtype
         audio = audio.astype('float32', copy=False)
